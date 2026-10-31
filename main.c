@@ -11,12 +11,19 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <dirent.h>
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <stddef.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include "web_ui.h"
 
 // Notification structure for libkernel (standard in ps5-payload-sdk)
 typedef struct notify_request {
@@ -38,6 +45,8 @@ typedef enum {
     DISC_TYPE_BD_MOVIE,
     DISC_TYPE_PS3_GAME
 } DiscType;
+
+const char* DetectUsbMount(void);
 
 // --- Logging subsystem for BDclone.log on USB ---
 static FILE* g_logFile = NULL;
@@ -110,6 +119,380 @@ void SendNotification(const char* message) {
     } else if (sceSysUtilSendSystemNotificationWithText) {
         sceSysUtilSendSystemNotificationWithText(222, message);
     }
+}
+
+// ============================================================================
+// --- Embedded Real-Time Web Server & Status Monitor ---
+// ============================================================================
+
+typedef struct {
+    char state[64];         // "WAITING_DISC", "ANALYZING", "COPYING", "FINISHED", "ERROR"
+    char title[256];        // Disc title, e.g. "Rocksmith [BLES01216]"
+    char mediaType[64];     // "PS3 Game disc" / "Blu-ray Movie disc"
+    char encryption[128];   // "PS3 Disc Encryption (DKEY / 3k3y / Redump)", "ENCRYPTED (AACS)", "CLEAR"
+    char mode[64];          // "Direct ISO clone (/dev/cd0) [DEFAULT]" or "Folder mode"
+    char destination[512];  // Destination path on USB
+    char usbMount[64];      // "/mnt/usb0"
+    uint64_t usbTotalBytes;
+    uint64_t usbFreeBytes;
+    uint64_t usbUsedBytes;
+    uint64_t bytesCopied;
+    uint64_t totalBytes;
+    double progressPct;
+    double speedMBps;
+    double avgSpeedMBps;
+    int elapsedSeconds;
+    int etaSeconds;
+    char statusMessage[256];
+    int isComplete;
+    int hasError;
+} WebStatus;
+
+static pthread_mutex_t g_webMutex = PTHREAD_MUTEX_INITIALIZER;
+static WebStatus g_webStatus = {
+    .state = "WAITING_DISC",
+    .statusMessage = "Waiting for optical disc insertion...",
+    .mediaType = "---",
+    .title = "Waiting for disc...",
+    .encryption = "---",
+    .mode = "Direct ISO clone (/dev/cd0) [DEFAULT]",
+    .destination = "---",
+    .usbMount = "---",
+    .usbTotalBytes = 0,
+    .usbFreeBytes = 0,
+    .usbUsedBytes = 0,
+    .bytesCopied = 0,
+    .totalBytes = 0,
+    .progressPct = 0.0,
+    .speedMBps = 0.0,
+    .avgSpeedMBps = 0.0,
+    .elapsedSeconds = 0,
+    .etaSeconds = 0,
+    .isComplete = 0,
+    .hasError = 0
+};
+
+static volatile int g_webServerRunning = 1;
+static int g_webPort = 8081;
+static char g_consoleIp[64] = "127.0.0.1";
+static pthread_t g_webThread;
+
+static void EscapeJsonString(char* dst, const char* src, size_t maxLen) {
+    if (!dst || maxLen == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t d = 0;
+    while (*src && d < maxLen - 1) {
+        if (*src == '"' || *src == '\\') {
+            if (d < maxLen - 2) {
+                dst[d++] = '\\';
+                dst[d++] = *src;
+            } else break;
+        } else if (*src == '\n' || *src == '\r' || *src == '\t') {
+            dst[d++] = ' ';
+        } else {
+            dst[d++] = *src;
+        }
+        src++;
+    }
+    dst[d] = '\0';
+}
+
+static void WebUpdateState(const char* state, const char* msg) {
+    pthread_mutex_lock(&g_webMutex);
+    if (state) snprintf(g_webStatus.state, sizeof(g_webStatus.state), "%s", state);
+    if (msg) snprintf(g_webStatus.statusMessage, sizeof(g_webStatus.statusMessage), "%s", msg);
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void WebUpdateDiscInfo(const char* title, const char* mediaType, const char* enc, const char* mode, const char* dest, uint64_t totalBytes) {
+    pthread_mutex_lock(&g_webMutex);
+    if (title) {
+        char cleanTitle[256];
+        snprintf(cleanTitle, sizeof(cleanTitle), "%s", title);
+        size_t len = strlen(cleanTitle);
+        if (len > 10 && strcmp(cleanTitle + len - 10, ".encrypted") == 0) {
+            cleanTitle[len - 10] = '\0';
+        }
+        snprintf(g_webStatus.title, sizeof(g_webStatus.title), "%s", cleanTitle);
+    }
+    if (mediaType) snprintf(g_webStatus.mediaType, sizeof(g_webStatus.mediaType), "%s", mediaType);
+    if (enc) snprintf(g_webStatus.encryption, sizeof(g_webStatus.encryption), "%s", enc);
+    if (mode) snprintf(g_webStatus.mode, sizeof(g_webStatus.mode), "%s", mode);
+    if (dest) snprintf(g_webStatus.destination, sizeof(g_webStatus.destination), "%s", dest);
+    if (totalBytes > 0) g_webStatus.totalBytes = totalBytes;
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void WebSetUsbDisconnected(void) {
+    pthread_mutex_lock(&g_webMutex);
+    snprintf(g_webStatus.usbMount, sizeof(g_webStatus.usbMount), "---");
+    g_webStatus.usbTotalBytes = 0;
+    g_webStatus.usbFreeBytes = 0;
+    g_webStatus.usbUsedBytes = 0;
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void WebUpdateUsbStats(const char* usbMount) {
+    if (!usbMount || usbMount[0] == '\0' || strcmp(usbMount, "---") == 0) {
+        WebSetUsbDisconnected();
+        return;
+    }
+    struct statvfs vfs;
+    if (statvfs(usbMount, &vfs) == 0 && vfs.f_blocks > 0 && vfs.f_frsize > 0) {
+        uint64_t total = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+        uint64_t freeBytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        uint64_t used = (total > freeBytes) ? (total - freeBytes) : 0;
+        
+        pthread_mutex_lock(&g_webMutex);
+        snprintf(g_webStatus.usbMount, sizeof(g_webStatus.usbMount), "%s", usbMount);
+        g_webStatus.usbTotalBytes = total;
+        g_webStatus.usbFreeBytes = freeBytes;
+        g_webStatus.usbUsedBytes = used;
+        pthread_mutex_unlock(&g_webMutex);
+    } else {
+        WebSetUsbDisconnected();
+    }
+}
+
+static void WebUpdateProgress(uint64_t copied, uint64_t total, double speedMBs, double avgSpeedMBs, int elapsedSec, int etaSec) {
+    pthread_mutex_lock(&g_webMutex);
+    g_webStatus.bytesCopied = copied;
+    if (total > 0) {
+        g_webStatus.totalBytes = total;
+        g_webStatus.progressPct = ((double)copied * 100.0) / (double)total;
+        if (g_webStatus.progressPct > 100.0) g_webStatus.progressPct = 100.0;
+    }
+    g_webStatus.speedMBps = speedMBs;
+    g_webStatus.avgSpeedMBps = avgSpeedMBs;
+    g_webStatus.elapsedSeconds = elapsedSec;
+    g_webStatus.etaSeconds = etaSec;
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void WebSetComplete(int isSuccess, const char* msg) {
+    pthread_mutex_lock(&g_webMutex);
+    if (isSuccess) {
+        g_webStatus.isComplete = 1;
+        g_webStatus.progressPct = 100.0;
+        snprintf(g_webStatus.state, sizeof(g_webStatus.state), "FINISHED");
+        if (msg) snprintf(g_webStatus.statusMessage, sizeof(g_webStatus.statusMessage), "%s", msg);
+    } else {
+        g_webStatus.hasError = 1;
+        snprintf(g_webStatus.state, sizeof(g_webStatus.state), "ERROR");
+        if (msg) snprintf(g_webStatus.statusMessage, sizeof(g_webStatus.statusMessage), "%s", msg);
+    }
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void DetectConsoleIp(char* outIp, size_t maxLen) {
+    strncpy(outIp, "127.0.0.1", maxLen);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s >= 0) {
+        struct sockaddr_in target;
+        memset(&target, 0, sizeof(target));
+        target.sin_family = AF_INET;
+        target.sin_addr.s_addr = inet_addr("1.1.1.1");
+        target.sin_port = htons(53);
+        if (connect(s, (struct sockaddr*)&target, sizeof(target)) == 0) {
+            struct sockaddr_in local;
+            socklen_t localLen = sizeof(local);
+            if (getsockname(s, (struct sockaddr*)&local, &localLen) == 0) {
+                inet_ntop(AF_INET, &local.sin_addr, outIp, maxLen);
+            }
+        }
+        close(s);
+    }
+}
+
+static void SendJsonStatus(int clientSock) {
+    // Dynamically refresh USB mount status in real-time
+    const char* detectedUsb = DetectUsbMount();
+    if (detectedUsb) {
+        WebUpdateUsbStats(detectedUsb);
+        InitLog(detectedUsb);
+    } else {
+        WebSetUsbDisconnected();
+    }
+
+    WebStatus st;
+    pthread_mutex_lock(&g_webMutex);
+    st = g_webStatus;
+    pthread_mutex_unlock(&g_webMutex);
+
+    char safeTitle[256];
+    char safeDest[512];
+    char safeMsg[256];
+    char safeUsb[64];
+    EscapeJsonString(safeTitle, st.title, sizeof(safeTitle));
+    EscapeJsonString(safeDest, st.destination, sizeof(safeDest));
+    EscapeJsonString(safeMsg, st.statusMessage, sizeof(safeMsg));
+    EscapeJsonString(safeUsb, st.usbMount, sizeof(safeUsb));
+
+    int elapsedM = st.elapsedSeconds / 60;
+    int elapsedS = st.elapsedSeconds % 60;
+    int etaM = st.etaSeconds / 60;
+    int etaS = st.etaSeconds % 60;
+
+    double copiedGB = (double)st.bytesCopied / (1024.0 * 1024.0 * 1024.0);
+    double totalGB = (double)st.totalBytes / (1024.0 * 1024.0 * 1024.0);
+
+    double usbTotalGB = (double)st.usbTotalBytes / (1024.0 * 1024.0 * 1024.0);
+    double usbFreeGB  = (double)st.usbFreeBytes  / (1024.0 * 1024.0 * 1024.0);
+    double usbUsedGB  = (double)st.usbUsedBytes  / (1024.0 * 1024.0 * 1024.0);
+    double usbUsedPct = (st.usbTotalBytes > 0) ? ((double)st.usbUsedBytes * 100.0) / (double)st.usbTotalBytes : 0.0;
+
+    char body[2560];
+    int bodyLen = snprintf(body, sizeof(body),
+        "{"
+        "\"state\":\"%s\","
+        "\"title\":\"%s\","
+        "\"mediaType\":\"%s\","
+        "\"encryption\":\"%s\","
+        "\"mode\":\"%s\","
+        "\"destination\":\"%s\","
+        "\"usbMount\":\"%s\","
+        "\"usbTotalBytes\":%llu,"
+        "\"usbFreeBytes\":%llu,"
+        "\"usbUsedBytes\":%llu,"
+        "\"usbTotalGB\":%.2f,"
+        "\"usbUsedGB\":%.2f,"
+        "\"usbFreeGB\":%.2f,"
+        "\"usbUsedPct\":%.1f,"
+        "\"bytesCopied\":%llu,"
+        "\"totalBytes\":%llu,"
+        "\"copiedGB\":%.2f,"
+        "\"totalGB\":%.2f,"
+        "\"progressPct\":%.1f,"
+        "\"speedMBps\":%.1f,"
+        "\"avgSpeedMBps\":%.1f,"
+        "\"elapsedSec\":%d,"
+        "\"etaSec\":%d,"
+        "\"elapsedStr\":\"%02dm %02ds\","
+        "\"etaStr\":\"%02dm %02ds\","
+        "\"statusMessage\":\"%s\","
+        "\"isComplete\":%s,"
+        "\"hasError\":%s"
+        "}",
+        st.state, safeTitle, st.mediaType, st.encryption, st.mode, safeDest,
+        safeUsb,
+        (unsigned long long)st.usbTotalBytes,
+        (unsigned long long)st.usbFreeBytes,
+        (unsigned long long)st.usbUsedBytes,
+        usbTotalGB, usbUsedGB, usbFreeGB, usbUsedPct,
+        (unsigned long long)st.bytesCopied, (unsigned long long)st.totalBytes,
+        copiedGB, totalGB, st.progressPct, st.speedMBps, st.avgSpeedMBps,
+        st.elapsedSeconds, st.etaSeconds,
+        elapsedM, elapsedS, etaM, etaS,
+        safeMsg,
+        st.isComplete ? "true" : "false",
+        st.hasError ? "true" : "false"
+    );
+
+    char header[256];
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "\r\n",
+        bodyLen
+    );
+
+    send(clientSock, header, headerLen, 0);
+    send(clientSock, body, bodyLen, 0);
+}
+
+static void SendHtmlPage(int clientSock) {
+    size_t bodyLen = strlen(g_indexHtml);
+    char header[256];
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "\r\n",
+        bodyLen
+    );
+
+    send(clientSock, header, headerLen, 0);
+    send(clientSock, g_indexHtml, bodyLen, 0);
+}
+
+static void* WebServerThread(void* arg) {
+    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSock < 0) {
+        LogMessage("[Web] [ERROR] Failed to create socket (errno=%d: %s)", errno, strerror(errno));
+        return NULL;
+    }
+
+    int opt = 1;
+    setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in servAddr;
+    memset(&servAddr, 0, sizeof(servAddr));
+    servAddr.sin_family = AF_INET;
+    servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servAddr.sin_port = htons(g_webPort);
+
+    if (bind(serverSock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
+        LogMessage("[Web] [WARN] Cannot bind port %d (errno=%d). Trying port 8080...", g_webPort, errno);
+        g_webPort = 8080;
+        servAddr.sin_port = htons(g_webPort);
+        if (bind(serverSock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
+            LogMessage("[Web] [ERROR] Cannot bind port 8080 either. Web server aborted.");
+            close(serverSock);
+            return NULL;
+        }
+    }
+
+    if (listen(serverSock, 16) < 0) {
+        LogMessage("[Web] [ERROR] listen() failed (errno=%d: %s)", errno, strerror(errno));
+        close(serverSock);
+        return NULL;
+    }
+
+    // Set 1s timeout on accept so the thread can terminate gracefully
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(serverSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    LogMessage("[Web] Web server listening on http://%s:%d (and http://127.0.0.1:%d)", 
+               g_consoleIp, g_webPort, g_webPort);
+
+    while (g_webServerRunning) {
+        struct sockaddr_in clientAddr;
+        socklen_t clientLen = sizeof(clientAddr);
+        int clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &clientLen);
+        if (clientSock < 0) {
+            continue;
+        }
+
+        struct timeval ctv;
+        ctv.tv_sec = 3;
+        ctv.tv_usec = 0;
+        setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof(ctv));
+        setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+
+        char reqBuf[2048] = {0};
+        ssize_t reqLen = recv(clientSock, reqBuf, sizeof(reqBuf) - 1, 0);
+        if (reqLen > 0) {
+            reqBuf[reqLen] = '\0';
+            if (strncmp(reqBuf, "GET /api/status", 15) == 0 || strncmp(reqBuf, "GET /status", 11) == 0) {
+                SendJsonStatus(clientSock);
+            } else {
+                SendHtmlPage(clientSock);
+            }
+        }
+        close(clientSock);
+    }
+
+    close(serverSock);
+    LogMessage("[Web] Web server stopped.");
+    return NULL;
 }
 
 // Case-insensitive substring search helper
@@ -458,14 +841,30 @@ DiscType FindDiscMount(char* outPath, size_t maxLen) {
     return DISC_TYPE_UNKNOWN;
 }
 
-// Detects connected USB storage (prefers /mnt/usb0, fallback to /mnt/usb1)
+static int IsMountPoint(const char* path) {
+    struct stat st1, st2;
+    if (stat(path, &st1) != 0) return 0;
+    char parent[512];
+    snprintf(parent, sizeof(parent), "%s/..", path);
+    if (stat(parent, &st2) != 0) return 0;
+    return (st1.st_dev != st2.st_dev);
+}
+
+// Detects connected USB storage by checking active mount points (/mnt/usb0 and /mnt/usb1)
 const char* DetectUsbMount(void) {
-    if (DirectoryExists("/mnt/usb0")) {
-        return "/mnt/usb0";
+    struct statfs *buf = NULL;
+    int n = getmntinfo(&buf, MNT_NOWAIT);
+    if (n > 0 && buf) {
+        for (int i = 0; i < n; i++) {
+            if (strcmp(buf[i].f_mntonname, "/mnt/usb0") == 0) return "/mnt/usb0";
+        }
+        for (int i = 0; i < n; i++) {
+            if (strcmp(buf[i].f_mntonname, "/mnt/usb1") == 0) return "/mnt/usb1";
+        }
     }
-    if (DirectoryExists("/mnt/usb1")) {
-        return "/mnt/usb1";
-    }
+    // Secondary check: verify filesystem device ID differs from parent directory
+    if (IsMountPoint("/mnt/usb0")) return "/mnt/usb0";
+    if (IsMountPoint("/mnt/usb1")) return "/mnt/usb1";
     return NULL;
 }
 
@@ -650,19 +1049,43 @@ typedef struct {
     struct timespec lastReportTime;
 } CopyStats;
 
-// Reports copy progress via notification
+// Reports copy progress via notification and updates real-time web monitor
 static void UpdateProgressReport(CopyStats* stats) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
+    double totalTime = (double)(now.tv_sec - stats->startTime.tv_sec) + 
+                       (double)(now.tv_nsec - stats->startTime.tv_nsec) / 1e9;
     double timeDelta = (double)(now.tv_sec - stats->lastReportTime.tv_sec) + 
                        (double)(now.tv_nsec - stats->lastReportTime.tv_nsec) / 1e9;
     uint64_t bytesDelta = stats->totalBytesCopied - stats->lastReportedBytes;
 
-    // Report progress every 1 GB OR every 30 seconds (if at least 50 MB transferred)
+    double currentSpeedMBs = (timeDelta > 0.05) ? ((double)bytesDelta / (1024.0 * 1024.0)) / timeDelta : 0.0;
+    double avgSpeedMBs = (totalTime > 0.05) ? ((double)stats->totalBytesCopied / (1024.0 * 1024.0)) / totalTime : 0.0;
+
+    int elapsedSec = (int)totalTime;
+    uint64_t remainingBytes = (stats->totalDiscBytes > stats->totalBytesCopied) ?
+                              (stats->totalDiscBytes - stats->totalBytesCopied) : 0;
+    int etaSec = (currentSpeedMBs > 0.1) ? (int)(((double)remainingBytes / (1024.0 * 1024.0)) / currentSpeedMBs) : 
+                 (avgSpeedMBs > 0.1 ? (int)(((double)remainingBytes / (1024.0 * 1024.0)) / avgSpeedMBs) : 0);
+
+    // Update real-time Web UI state on every single data block
+    WebUpdateProgress(stats->totalBytesCopied, stats->totalDiscBytes,
+                      currentSpeedMBs > 0.0 ? currentSpeedMBs : avgSpeedMBs,
+                      avgSpeedMBs, elapsedSec, etaSec);
+
+    // Update live USB storage space stats as files are written
+    pthread_mutex_lock(&g_webMutex);
+    char currentUsb[64];
+    snprintf(currentUsb, sizeof(currentUsb), "%s", g_webStatus.usbMount);
+    pthread_mutex_unlock(&g_webMutex);
+    if (currentUsb[0] == '/') {
+        WebUpdateUsbStats(currentUsb);
+    }
+
+    // Report progress to PS5 on-screen notification every 1 GB OR every 30 seconds (if at least 50 MB transferred)
     if (bytesDelta >= 1024ULL * 1024ULL * 1024ULL || 
         (timeDelta >= 30.0 && bytesDelta >= 50ULL * 1024ULL * 1024ULL)) {
         
-        double speedMBs = (timeDelta > 0.0) ? ((double)bytesDelta / (1024.0 * 1024.0)) / timeDelta : 0.0;
         stats->lastReportedBytes = stats->totalBytesCopied;
         stats->lastReportTime = now;
 
@@ -672,21 +1095,17 @@ static void UpdateProgressReport(CopyStats* stats) {
         if (stats->totalDiscBytes > 0) {
             double totalGB = (double)stats->totalDiscBytes / (1024.0 * 1024.0 * 1024.0);
             int percent = (int)((stats->totalBytesCopied * 100ULL) / stats->totalDiscBytes);
-            
-            uint64_t remainingBytes = (stats->totalDiscBytes > stats->totalBytesCopied) ?
-                                      (stats->totalDiscBytes - stats->totalBytesCopied) : 0;
-            int etaSec = (speedMBs > 0.1) ? (int)(((double)remainingBytes / (1024.0 * 1024.0)) / speedMBs) : 0;
             int etaMin = etaSec / 60;
 
             if (etaMin > 0) {
                 snprintf(notifyBuffer, sizeof(notifyBuffer), "Copy: %d%% (%.1f/%.1f GB) | %.1f MB/s | ETA: %dm", 
-                         percent, copiedGB, totalGB, speedMBs, etaMin);
+                         percent, copiedGB, totalGB, currentSpeedMBs, etaMin);
             } else {
                 snprintf(notifyBuffer, sizeof(notifyBuffer), "Copy: %d%% (%.1f/%.1f GB) | %.1f MB/s", 
-                         percent, copiedGB, totalGB, speedMBs);
+                         percent, copiedGB, totalGB, currentSpeedMBs);
             }
         } else {
-            snprintf(notifyBuffer, sizeof(notifyBuffer), "Copy: %.1f GB | %.1f MB/s", copiedGB, speedMBs);
+            snprintf(notifyBuffer, sizeof(notifyBuffer), "Copy: %.1f GB | %.1f MB/s", copiedGB, currentSpeedMBs);
         }
         SendNotification(notifyBuffer);
     }
@@ -817,6 +1236,9 @@ int CopyDisc(const char* srcDir, const char* dstDir, const char* usbMount, const
     }
     SendNotification(notifyBuffer);
 
+    WebUpdateDiscInfo(NULL, NULL, NULL, "Directory copy (folder mode)", dstDir, totalDiscBytes);
+    WebUpdateState("COPYING", "Copying disc files to USB folder...");
+
     // Check available space on USB drive
     struct statvfs vfs;
     if (statvfs(usbMount, &vfs) == 0) {
@@ -923,6 +1345,9 @@ int CopyDiscToIso(const char* discMount, const char* dstIsoPath, const char* usb
         snprintf(notifyBuffer, sizeof(notifyBuffer), "\"%s\": Creating ISO...", fullTitle);
     }
     SendNotification(notifyBuffer);
+
+    WebUpdateDiscInfo(NULL, NULL, NULL, "Direct 1:1 ISO clone (/dev/cd0) [DEFAULT]", dstIsoPath, totalDiscBytes);
+    WebUpdateState("COPYING", "Cloning optical disc sectors to ISO...");
 
     // 3. Pre-check free space on USB drive
     struct statvfs usbVfs;
@@ -1093,7 +1518,12 @@ int main(void) {
     const char* earlyUsb = DetectUsbMount();
     if (earlyUsb) {
         InitLog(earlyUsb);
+        WebUpdateUsbStats(earlyUsb);
     }
+
+    // Start background Web Server status monitor on port 8081
+    DetectConsoleIp(g_consoleIp, sizeof(g_consoleIp));
+    pthread_create(&g_webThread, NULL, WebServerThread, NULL);
 
     LogMessage("==================================================");
     LogMessage("=== BDclone Daemon for PS5 started ===");
@@ -1104,28 +1534,51 @@ int main(void) {
         LogMessage("[Main] USB drive not mounted yet (buffering logs in RAM)");
     }
 
+    char webNotify[256];
+    if (strcmp(g_consoleIp, "127.0.0.1") != 0) {
+        snprintf(webNotify, sizeof(webNotify), "BDclone Web: http://%s:%d", g_consoleIp, g_webPort);
+    } else {
+        snprintf(webNotify, sizeof(webNotify), "BDclone Web: port %d", g_webPort);
+    }
+    SendNotification(webNotify);
+
     // 1. Wait for optical disc (Blu-ray Movie or PS3 Game) to be inserted and mounted at /mnt/disc
     SendNotification("BDclone Daemon: Waiting for disc insertion...");
     LogMessage("[Main] Waiting for disc mount at /mnt/disc...");
+    WebUpdateState("WAITING_DISC", "Waiting for optical disc insertion...");
 
     DiscType discType = DISC_TYPE_UNKNOWN;
     while ((discType = FindDiscMount(discPath, sizeof(discPath))) == DISC_TYPE_UNKNOWN) {
+        const char* usb = DetectUsbMount();
+        if (usb) {
+            InitLog(usb);
+            WebUpdateUsbStats(usb);
+        } else {
+            WebSetUsbDisconnected();
+        }
         sleep(2); // Poll every 2 seconds
     }
 
     const char* typeDesc = (discType == DISC_TYPE_PS3_GAME) ? "PS3 Game disc" : "Blu-ray Movie disc";
     LogMessage("[Main] Success: Detected mounted %s at: %s", typeDesc, discPath);
+    WebUpdateState("ANALYZING", "Optical disc detected. Reading metadata...");
 
     // 2. Detect connected USB storage (/mnt/usb0 or /mnt/usb1)
     const char* usbMount = DetectUsbMount();
     if (!usbMount) {
-        SendNotification("Error: No USB drive detected (/mnt/usb0)!");
-        LogMessage("[FATAL] No USB drive detected (/mnt/usb0 or /mnt/usb1). Aborting!");
-        CloseLog();
-        return -1;
+        SendNotification("Please connect USB drive (/mnt/usb0)!");
+        LogMessage("[Main] Optical disc detected, but no USB storage found. Waiting for USB drive...");
+        WebUpdateState("WAITING_USB", "Optical disc detected! Please connect USB storage drive...");
+        while ((usbMount = DetectUsbMount()) == NULL) {
+            sleep(2);
+        }
+        LogMessage("[Main] Success: USB drive detected at %s", usbMount);
+        SendNotification("USB storage connected!");
+        WebUpdateState("ANALYZING", "USB drive detected. Reading metadata...");
     }
 
     InitLog(usbMount); // Ensure log file is open
+    WebUpdateUsbStats(usbMount);
 
     // 3. Detect disc title (from BDMV XML metadata or PS3 PARAM.SFO)
     char discTitle[256] = {0};
@@ -1199,6 +1652,8 @@ int main(void) {
     LogMessage("[Main]   Finished flag: %s", flagFinished);
     LogMessage("[Main]   Destination:   %s (%s)", usbDstPath, isIsoMode ? "ISO image file" : "directory");
 
+    WebUpdateDiscInfo(discTitle, typeDesc, encStatus, isIsoMode ? "Direct ISO clone (/dev/cd0) [DEFAULT]" : "Directory copy (folder mode)", usbDstPath, 0);
+
     // 6. Create empty <fullTitle>.copying flag file on USB
     int flagFd = open(flagCopying, O_WRONLY | O_CREAT | O_TRUNC, 0777);
     if (flagFd >= 0) {
@@ -1230,6 +1685,8 @@ int main(void) {
     }
 
     if (copyResult == 0) {
+        WebSetComplete(1, "Clone completed successfully!");
+
         // 8. Success: rename flag to <fullTitle>.finished
         int renRet = rename(flagCopying, flagFinished);
         if (renRet == 0) {
@@ -1255,14 +1712,22 @@ int main(void) {
         LogMessage("==================================================");
         LogMessage("=== BDclone Completed with Full Success! ===");
         LogMessage("==================================================");
+        LogMessage("[Web] Keeping live web status page active for 60 seconds before exit...");
+        sleep(60);
     } else {
+        WebSetComplete(0, "Clone aborted with error!");
         SendNotification(isIsoMode ? "Error: Disc ISO copy failed!" : "Error: Disc copy failed!");
         LogMessage("[FATAL] Copy failed with error: %d. Removing copying flag.", copyResult);
         unlink(flagCopying);
         if (isIsoMode) {
             unlink(usbDstPath);
         }
+        sleep(15);
     }
+
+    // Stop web server thread gracefully
+    g_webServerRunning = 0;
+    pthread_join(g_webThread, NULL);
 
     CloseLog();
     return copyResult;

@@ -29,6 +29,15 @@ This PS5 payload dumps optical discs directly to external USB storage as either 
   Verifies available space on the USB drive via `statvfs` prior to copying. If the destination lacks sufficient space, the process halts safely without leaving broken, oversized files.
 * **Progress Tracking & PS5 On-Screen Notifications**:  
   Displays native on-screen notifications for disc detection, encryption status, transfer progress (percentage, transferred GB, speed in MB/s, and ETA), and final completion.
+* **Embedded Real-Time Web Monitor (`http://<PS5_IP>:8081`)**:  
+  Runs a built-in lightweight HTTP status server on port `8081`. Open it in any web browser (phone, PC, or tablet on your local network) to monitor the copy process in real time on a PlayStation-styled dashboard:
+  * Live percentage and animated progress bar
+  * Data transferred (`X.XX / Y.YY GB`) and remaining data
+  * Real-time transfer speed (`XX.X MB/s`) and average speed
+  * Elapsed live timer and Estimated Time Remaining (ETA)
+  * Live USB storage capacity monitor: used space, free space in GB, and capacity gauge bar
+  * Disc title, media type, DRM encryption status, and destination path
+  * Completely automated and buttonless — pure live monitor.
 * **Copy State Flag Files**:  
   Creates `<Title>[.encrypted].copying` on the USB root during transfer, and renames it to `<Title>[.encrypted].finished` on success.
 * **Persistent USB Logging**:  
@@ -56,6 +65,7 @@ Streaming sequential 4 MB blocks directly from `/dev/cd0` engages the optical dr
 ```text
 BDmovie/
 ├── main.c              # Core daemon payload (BDclone.elf)
+├── web_ui.h            # Embedded dark-mode web status dashboard UI
 ├── Makefile            # Build configuration for prospero-clang / Clang
 └── README.md           # Documentation
 ```
@@ -124,15 +134,17 @@ make send PS5_HOST=192.168.1.150
    ```bash
    make send PS5_HOST=<YOUR_PS5_IP>
    ```
-3. A notification will appear on screen:
+3. Notifications will appear on screen:
+   > **BDclone Web: http://<PS5_IP>:8081**  
    > **BDclone Daemon: Waiting for disc insertion...**
-4. Insert your Blu-ray disc into the drive.
-5. The daemon will automatically:
+4. *(Optional)* Open `http://<PS5_IP>:8081` in your browser (phone or PC) to monitor real-time cloning progress.
+5. Insert your Blu-ray or PS3 disc into the drive.
+6. The daemon will automatically:
    * Detect the disc mount at `/mnt/disc`.
-   * Extract the movie title from XML metadata.
-   * Analyze stream encryption status (displays `[ENCRYPTED - AACS]` or `[CLEAR - UNENCRYPTED]`).
+   * Extract the movie/game title.
+   * Analyze encryption status.
    * Verify USB storage capacity.
    * Create the `<Title>[.encrypted].copying` flag file on the USB root.
-   * Stream data to USB with periodic on-screen progress updates (GB, %, MB/s, ETA).
+   * Stream data to USB with live updates in the Web UI (every second) and on-screen TV notifications (every 1 GB / 30s).
    * Rename flag to `<Title>[.encrypted].finished` when complete.
-6. A completion notification will show the total data copied, elapsed time, and average transfer speed.
+7. A completion notification will show the total data copied, elapsed time, and average transfer speed (the Web UI stays active for 60 seconds before clean exit).
