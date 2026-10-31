@@ -49,35 +49,27 @@ typedef enum {
 const char* DetectUsbMount(void);
 
 // --- Logging subsystem for BDclone.log on USB ---
-static FILE* g_logFile = NULL;
-static char g_logBufferEarly[8192] = {0};
+static pthread_mutex_t g_logMutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_activeLogUsb[128] = {0};
+static char g_logBufferEarly[16384] = {0};
 static size_t g_logBufferEarlyLen = 0;
 
 void InitLog(const char* usbMount) {
-    if (g_logFile) return;
-    char logPath[512];
-    snprintf(logPath, sizeof(logPath), "%s/BDclone.log", usbMount);
-    g_logFile = fopen(logPath, "a");
-    if (g_logFile) {
-        if (g_logBufferEarlyLen > 0) {
-            fwrite(g_logBufferEarly, 1, g_logBufferEarlyLen, g_logFile);
-            fflush(g_logFile);
-            fsync(fileno(g_logFile));
-            g_logBufferEarlyLen = 0;
-        }
-    }
+    if (!usbMount || usbMount[0] == '\0') return;
+    pthread_mutex_lock(&g_logMutex);
+    snprintf(g_activeLogUsb, sizeof(g_activeLogUsb), "%s", usbMount);
+    pthread_mutex_unlock(&g_logMutex);
 }
 
 void CloseLog(void) {
-    if (g_logFile) {
-        fflush(g_logFile);
-        fsync(fileno(g_logFile));
-        fclose(g_logFile);
-        g_logFile = NULL;
-    }
+    pthread_mutex_lock(&g_logMutex);
+    g_activeLogUsb[0] = '\0';
+    pthread_mutex_unlock(&g_logMutex);
 }
 
 void LogMessage(const char* fmt, ...) {
+    pthread_mutex_lock(&g_logMutex);
+
     char timeStr[32];
     time_t now = time(NULL);
     struct tm* tm_info = localtime(&now);
@@ -93,19 +85,37 @@ void LogMessage(const char* fmt, ...) {
     vsnprintf(msgBuffer, sizeof(msgBuffer), fmt, args);
     va_end(args);
 
-    if (g_logFile) {
-        fprintf(g_logFile, "%s%s\n", timeStr, msgBuffer);
-        fflush(g_logFile);
-        fsync(fileno(g_logFile));
-    } else {
-        // Buffer into RAM if USB log file is not opened yet
-        size_t needed = strlen(timeStr) + strlen(msgBuffer) + 2;
-        if (sizeof(g_logBufferEarly) - g_logBufferEarlyLen > needed) {
-            g_logBufferEarlyLen += snprintf(g_logBufferEarly + g_logBufferEarlyLen,
-                                           sizeof(g_logBufferEarly) - g_logBufferEarlyLen,
-                                           "%s%s\n", timeStr, msgBuffer);
+    const char* usb = g_activeLogUsb[0] ? g_activeLogUsb : DetectUsbMount();
+    if (usb && usb[0] != '\0') {
+        if (g_activeLogUsb[0] == '\0') {
+            snprintf(g_activeLogUsb, sizeof(g_activeLogUsb), "%s", usb);
+        }
+        char logPath[512];
+        snprintf(logPath, sizeof(logPath), "%s/BDclone.log", usb);
+        FILE* fp = fopen(logPath, "a");
+        if (fp) {
+            // Write any buffered logs from startup first
+            if (g_logBufferEarlyLen > 0) {
+                fwrite(g_logBufferEarly, 1, g_logBufferEarlyLen, fp);
+                g_logBufferEarlyLen = 0;
+            }
+            fprintf(fp, "%s%s\n", timeStr, msgBuffer);
+            fflush(fp);
+            fclose(fp);
+            pthread_mutex_unlock(&g_logMutex);
+            return;
         }
     }
+
+    // Buffer in RAM if USB drive is not ready yet or write failed
+    size_t needed = strlen(timeStr) + strlen(msgBuffer) + 2;
+    if (sizeof(g_logBufferEarly) - g_logBufferEarlyLen > needed) {
+        g_logBufferEarlyLen += snprintf(g_logBufferEarly + g_logBufferEarlyLen,
+                                       sizeof(g_logBufferEarly) - g_logBufferEarlyLen,
+                                       "%s%s\n", timeStr, msgBuffer);
+    }
+
+    pthread_mutex_unlock(&g_logMutex);
 }
 
 // Sends on-screen system notification on PS5 (and writes to log)
@@ -173,6 +183,7 @@ static WebStatus g_webStatus = {
 };
 
 static volatile int g_webServerRunning = 1;
+static volatile int g_daemonRunning = 1;
 static int g_webPort = 8081;
 static char g_consoleIp[64] = "127.0.0.1";
 static pthread_t g_webThread;
@@ -281,6 +292,27 @@ static void WebSetComplete(int isSuccess, const char* msg) {
         snprintf(g_webStatus.state, sizeof(g_webStatus.state), "ERROR");
         if (msg) snprintf(g_webStatus.statusMessage, sizeof(g_webStatus.statusMessage), "%s", msg);
     }
+    pthread_mutex_unlock(&g_webMutex);
+}
+
+static void WebResetState(void) {
+    pthread_mutex_lock(&g_webMutex);
+    snprintf(g_webStatus.state, sizeof(g_webStatus.state), "WAITING_DISC");
+    snprintf(g_webStatus.statusMessage, sizeof(g_webStatus.statusMessage), "Waiting for optical disc insertion...");
+    snprintf(g_webStatus.title, sizeof(g_webStatus.title), "Waiting for disc...");
+    snprintf(g_webStatus.mediaType, sizeof(g_webStatus.mediaType), "---");
+    snprintf(g_webStatus.encryption, sizeof(g_webStatus.encryption), "---");
+    snprintf(g_webStatus.mode, sizeof(g_webStatus.mode), "Direct ISO clone (/dev/cd0) [DEFAULT]");
+    snprintf(g_webStatus.destination, sizeof(g_webStatus.destination), "---");
+    g_webStatus.bytesCopied = 0;
+    g_webStatus.totalBytes = 0;
+    g_webStatus.progressPct = 0.0;
+    g_webStatus.speedMBps = 0.0;
+    g_webStatus.avgSpeedMBps = 0.0;
+    g_webStatus.elapsedSeconds = 0;
+    g_webStatus.etaSeconds = 0;
+    g_webStatus.isComplete = 0;
+    g_webStatus.hasError = 0;
     pthread_mutex_unlock(&g_webMutex);
 }
 
@@ -481,7 +513,16 @@ static void* WebServerThread(void* arg) {
         ssize_t reqLen = recv(clientSock, reqBuf, sizeof(reqBuf) - 1, 0);
         if (reqLen > 0) {
             reqBuf[reqLen] = '\0';
-            if (strncmp(reqBuf, "GET /api/status", 15) == 0 || strncmp(reqBuf, "GET /status", 11) == 0) {
+            if (strstr(reqBuf, "/api/exit") != NULL) {
+                const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"status\":\"stopping\"}";
+                send(clientSock, resp, strlen(resp), 0);
+                close(clientSock);
+                LogMessage("[Web] Exit command received from Web UI. Shutting down BDclone daemon...");
+                SendNotification("BDclone: Stopping daemon...");
+                g_daemonRunning = 0;
+                g_webServerRunning = 0;
+                break;
+            } else if (strncmp(reqBuf, "GET /api/status", 15) == 0 || strncmp(reqBuf, "GET /status", 11) == 0) {
                 SendJsonStatus(clientSock);
             } else {
                 SendHtmlPage(clientSock);
@@ -1022,6 +1063,7 @@ static uint64_t CalculateDirectorySize(const char* dirPath) {
     struct stat st;
 
     while ((entry = readdir(dir)) != NULL) {
+        if (!g_daemonRunning) break;
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
@@ -1136,6 +1178,11 @@ static int CopyFile(const char* srcFile, const char* dstFile, char* buffer, size
     int copyResult = 0;
 
     while ((bytesRead = read(inFd, buffer, bufferSize)) > 0) {
+        if (!g_daemonRunning) {
+            LogMessage("[Copy] File copy cancelled by daemon shutdown request.");
+            copyResult = -1;
+            break;
+        }
         ssize_t totalWritten = 0;
         while (totalWritten < bytesRead) {
             ssize_t written = write(outFd, buffer + totalWritten, bytesRead - totalWritten);
@@ -1188,6 +1235,10 @@ static int CopyDirectoryRecursive(const char* srcDir, const char* dstDir, char* 
     int status = 0;
 
     while ((entry = readdir(dir)) != NULL) {
+        if (!g_daemonRunning) {
+            status = -1;
+            break;
+        }
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
@@ -1412,6 +1463,11 @@ int CopyDiscToIso(const char* discMount, const char* dstIsoPath, const char* usb
     uint64_t remaining = totalDiscBytes;
 
     while (totalDiscBytes == 0 || remaining > 0) {
+        if (!g_daemonRunning) {
+            LogMessage("[CopyIso] ISO copy cancelled by daemon shutdown request.");
+            copyResult = -1;
+            break;
+        }
         size_t toRead = bufferSize;
         if (totalDiscBytes > 0 && toRead > remaining) {
             toRead = (size_t)remaining;
@@ -1512,8 +1568,6 @@ int CheckDontMakeIsoTrigger(const char* usbMount) {
 }
 
 int main(void) {
-    char discPath[1024] = {0};
-
     // Early USB detection to initialize file logging immediately
     const char* earlyUsb = DetectUsbMount();
     if (earlyUsb) {
@@ -1542,193 +1596,211 @@ int main(void) {
     }
     SendNotification(webNotify);
 
-    // 1. Wait for optical disc (Blu-ray Movie or PS3 Game) to be inserted and mounted at /mnt/disc
-    SendNotification("BDclone Daemon: Waiting for disc insertion...");
-    LogMessage("[Main] Waiting for disc mount at /mnt/disc...");
-    WebUpdateState("WAITING_DISC", "Waiting for optical disc insertion...");
+    // Continuous loop: process optical discs sequentially until user stops the daemon
+    while (g_daemonRunning) {
+        WebResetState();
 
-    DiscType discType = DISC_TYPE_UNKNOWN;
-    while ((discType = FindDiscMount(discPath, sizeof(discPath))) == DISC_TYPE_UNKNOWN) {
-        const char* usb = DetectUsbMount();
-        if (usb) {
-            InitLog(usb);
-            WebUpdateUsbStats(usb);
-        } else {
-            WebSetUsbDisconnected();
+        SendNotification("BDclone Daemon: Waiting for disc insertion...");
+        LogMessage("[Main] Waiting for disc mount at /mnt/disc...");
+
+        char discPath[1024] = {0};
+        DiscType discType = DISC_TYPE_UNKNOWN;
+        while (g_daemonRunning && (discType = FindDiscMount(discPath, sizeof(discPath))) == DISC_TYPE_UNKNOWN) {
+            const char* usb = DetectUsbMount();
+            if (usb) {
+                InitLog(usb);
+                WebUpdateUsbStats(usb);
+            } else {
+                WebSetUsbDisconnected();
+            }
+            sleep(2); // Poll every 2 seconds
         }
-        sleep(2); // Poll every 2 seconds
-    }
 
-    const char* typeDesc = (discType == DISC_TYPE_PS3_GAME) ? "PS3 Game disc" : "Blu-ray Movie disc";
-    LogMessage("[Main] Success: Detected mounted %s at: %s", typeDesc, discPath);
-    WebUpdateState("ANALYZING", "Optical disc detected. Reading metadata...");
+        if (!g_daemonRunning) break;
 
-    // 2. Detect connected USB storage (/mnt/usb0 or /mnt/usb1)
-    const char* usbMount = DetectUsbMount();
-    if (!usbMount) {
-        SendNotification("Please connect USB drive (/mnt/usb0)!");
-        LogMessage("[Main] Optical disc detected, but no USB storage found. Waiting for USB drive...");
-        WebUpdateState("WAITING_USB", "Optical disc detected! Please connect USB storage drive...");
-        while ((usbMount = DetectUsbMount()) == NULL) {
+        const char* typeDesc = (discType == DISC_TYPE_PS3_GAME) ? "PS3 Game disc" : "Blu-ray Movie disc";
+        LogMessage("[Main] Success: Detected mounted %s at: %s", typeDesc, discPath);
+        WebUpdateState("ANALYZING", "Optical disc detected. Reading metadata...");
+
+        // 2. Detect connected USB storage (/mnt/usb0 or /mnt/usb1)
+        const char* usbMount = DetectUsbMount();
+        if (!usbMount) {
+            SendNotification("Please connect USB drive (/mnt/usb0)!");
+            LogMessage("[Main] Optical disc detected, but no USB storage found. Waiting for USB drive...");
+            WebUpdateState("WAITING_USB", "Optical disc detected! Please connect USB storage drive...");
+            while (g_daemonRunning && (usbMount = DetectUsbMount()) == NULL) {
+                sleep(2);
+            }
+            if (!g_daemonRunning) break;
+            LogMessage("[Main] Success: USB drive detected at %s", usbMount);
+            SendNotification("USB storage connected!");
+            WebUpdateState("ANALYZING", "USB drive detected. Reading metadata...");
+        }
+
+        InitLog(usbMount); // Ensure log file is open
+        WebUpdateUsbStats(usbMount);
+
+        // 3. Detect disc title (from BDMV XML metadata or PS3 PARAM.SFO)
+        char discTitle[256] = {0};
+        DetectDiscTitle(discPath, discType, discTitle, sizeof(discTitle));
+
+        // 4. Automated stream encryption verification (applies to Blu-ray Movies)
+        int isEncrypted = 0;
+        if (discType == DISC_TYPE_BD_MOVIE) {
+            isEncrypted = DetectDiscEncryption(discPath);
+            char statusNotify[256];
+            if (isEncrypted) {
+                snprintf(statusNotify, sizeof(statusNotify), "Movie: \"%s\" [ENCRYPTED - AACS]", discTitle);
+            } else {
+                snprintf(statusNotify, sizeof(statusNotify), "Movie: \"%s\" [CLEAR - UNENCRYPTED]", discTitle);
+            }
+            SendNotification(statusNotify);
+        } else {
+            char statusNotify[256];
+            snprintf(statusNotify, sizeof(statusNotify), "PS3 Game: \"%s\"", discTitle);
+            SendNotification(statusNotify);
+            LogMessage("[Main] Media type: PS3 Game");
+        }
+
+        // Tag destination name with .encrypted if disc streams are encrypted
+        char fullTitle[300];
+        if (isEncrypted) {
+            snprintf(fullTitle, sizeof(fullTitle), "%s.encrypted", discTitle);
+        } else {
+            snprintf(fullTitle, sizeof(fullTitle), "%s", discTitle);
+        }
+
+        // 5. Determine operation mode (ISO is DEFAULT, folder mode if 'dont_make_iso' trigger is present)
+        int isFolderMode = CheckDontMakeIsoTrigger(usbMount);
+        int isIsoMode = !isFolderMode;
+
+        if (isFolderMode) {
+            LogMessage("[Main] >>> 'dont_make_iso' trigger detected on USB root! <<<");
+            LogMessage("[Main] Mode: Standard directory copy (folder mode)");
+        } else {
+            LogMessage("[Main] Mode: Direct bit-perfect ISO clone (/dev/cd0) [DEFAULT]");
+        }
+
+        char flagCopying[512];
+        char flagFinished[512];
+        char usbDstPath[512];
+
+        snprintf(flagCopying, sizeof(flagCopying), "%s/%s.copying", usbMount, fullTitle);
+        snprintf(flagFinished, sizeof(flagFinished), "%s/%s.finished", usbMount, fullTitle);
+
+        if (isIsoMode) {
+            snprintf(usbDstPath, sizeof(usbDstPath), "%s/%s.iso", usbMount, fullTitle);
+        } else {
+            snprintf(usbDstPath, sizeof(usbDstPath), "%s/%s", usbMount, fullTitle);
+        }
+
+        const char* encStatus;
+        if (discType == DISC_TYPE_PS3_GAME) {
+            encStatus = "PS3 Disc Encryption (DKEY / 3k3y / Redump)";
+        } else if (isEncrypted) {
+            encStatus = "ENCRYPTED (AACS - tagged .encrypted)";
+        } else {
+            encStatus = "CLEAR / UNENCRYPTED";
+        }
+
+        LogMessage("[Main] Path configuration:");
+        LogMessage("[Main]   Media type:    %s", typeDesc);
+        LogMessage("[Main]   Title:         %s", discTitle);
+        LogMessage("[Main]   Encryption:    %s", encStatus);
+        LogMessage("[Main]   Output name:   %s", fullTitle);
+        LogMessage("[Main]   Copying flag:  %s", flagCopying);
+        LogMessage("[Main]   Finished flag: %s", flagFinished);
+        LogMessage("[Main]   Destination:   %s (%s)", usbDstPath, isIsoMode ? "ISO image file" : "directory");
+
+        WebUpdateDiscInfo(discTitle, typeDesc, encStatus, isIsoMode ? "Direct ISO clone (/dev/cd0) [DEFAULT]" : "Directory copy (folder mode)", usbDstPath, 0);
+
+        // 6. Create empty <fullTitle>.copying flag file on USB
+        int flagFd = open(flagCopying, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+        if (flagFd >= 0) {
+            close(flagFd);
+            LogMessage("[Main] Created empty flag file: %s (fd=%d)", flagCopying, flagFd);
+        } else {
+            LogMessage("[FATAL] Cannot create flag %s (errno=%d: %s)", flagCopying, errno, strerror(errno));
+            SendNotification("Error: Failed to create flag file on USB!");
+            sleep(3);
+            continue;
+        }
+
+        int copyResult;
+        if (isIsoMode) {
+            // 7a. Direct optical disc sector-to-ISO clone from /dev/cd0 (DEFAULT)
+            LogMessage("[Main] Starting optical disc ISO clone: /dev/cd0 -> %s", usbDstPath);
+            copyResult = CopyDiscToIso(discPath, usbDstPath, usbMount, fullTitle);
+        } else {
+            // 7b. Standard directory copy
+            int mkRes = mkdir(usbDstPath, 0777);
+            if (mkRes == 0) {
+                LogMessage("[Main] Created target folder: %s", usbDstPath);
+            } else if (errno == EEXIST) {
+                LogMessage("[Main] Target folder already exists: %s", usbDstPath);
+            } else {
+                LogMessage("[Main] [WARN] mkdir(%s) failed: errno=%d (%s)", usbDstPath, errno, strerror(errno));
+            }
+            copyResult = CopyDisc(discPath, usbDstPath, usbMount, fullTitle);
+        }
+
+        if (copyResult == 0) {
+            WebSetComplete(1, "Dump completed! Please eject disc to clone another.");
+
+            // 8. Success: rename flag to <fullTitle>.finished
+            int renRet = rename(flagCopying, flagFinished);
+            if (renRet == 0) {
+                LogMessage("[Main] Renamed flag: %s -> %s (SUCCESS)", flagCopying, flagFinished);
+            } else {
+                unlink(flagCopying);
+                int finFd = open(flagFinished, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+                if (finFd >= 0) close(finFd);
+                LogMessage("[Main] Created directly: %s (finFd=%d)", flagFinished, finFd);
+            }
+
+            const char* mediaName = (discType == DISC_TYPE_PS3_GAME) ? "PS3 Game" : "Movie";
+            char finishedNotify[256];
+            if (isIsoMode) {
+                snprintf(finishedNotify, sizeof(finishedNotify), "%s \"%s\": ISO dump completed! Eject disc.", mediaName, fullTitle);
+            } else {
+                snprintf(finishedNotify, sizeof(finishedNotify), "%s \"%s\": dump completed! Eject disc.", mediaName, fullTitle);
+            }
+            SendNotification(finishedNotify);
+
+            LogMessage("==================================================");
+            LogMessage("=== BDclone: Dump completed successfully! ===");
+            LogMessage("==================================================");
+        } else {
+            WebSetComplete(0, "Clone aborted with error!");
+            SendNotification(isIsoMode ? "Error: Disc ISO copy failed!" : "Error: Disc copy failed!");
+            LogMessage("[FATAL] Copy failed with error: %d. Removing copying flag.", copyResult);
+            unlink(flagCopying);
+            if (isIsoMode) {
+                unlink(usbDstPath);
+            }
+        }
+
+        if (!g_daemonRunning) break;
+
+        LogMessage("[Main] Waiting for optical disc to be ejected from drive...");
+        char checkPath[512];
+        while (g_daemonRunning && FindDiscMount(checkPath, sizeof(checkPath)) != DISC_TYPE_UNKNOWN) {
             sleep(2);
         }
-        LogMessage("[Main] Success: USB drive detected at %s", usbMount);
-        SendNotification("USB storage connected!");
-        WebUpdateState("ANALYZING", "USB drive detected. Reading metadata...");
-    }
 
-    InitLog(usbMount); // Ensure log file is open
-    WebUpdateUsbStats(usbMount);
+        if (!g_daemonRunning) break;
 
-    // 3. Detect disc title (from BDMV XML metadata or PS3 PARAM.SFO)
-    char discTitle[256] = {0};
-    DetectDiscTitle(discPath, discType, discTitle, sizeof(discTitle));
-
-    // 4. Automated stream encryption verification (applies to Blu-ray Movies)
-    int isEncrypted = 0;
-    if (discType == DISC_TYPE_BD_MOVIE) {
-        isEncrypted = DetectDiscEncryption(discPath);
-        char statusNotify[256];
-        if (isEncrypted) {
-            snprintf(statusNotify, sizeof(statusNotify), "Movie: \"%s\" [ENCRYPTED - AACS]", discTitle);
-        } else {
-            snprintf(statusNotify, sizeof(statusNotify), "Movie: \"%s\" [CLEAR - UNENCRYPTED]", discTitle);
-        }
-        SendNotification(statusNotify);
-    } else {
-        char statusNotify[256];
-        snprintf(statusNotify, sizeof(statusNotify), "PS3 Game: \"%s\"", discTitle);
-        SendNotification(statusNotify);
-        LogMessage("[Main] Media type: PS3 Game");
-    }
-
-    // Tag destination name with .encrypted if disc streams are encrypted
-    char fullTitle[300];
-    if (isEncrypted) {
-        snprintf(fullTitle, sizeof(fullTitle), "%s.encrypted", discTitle);
-    } else {
-        snprintf(fullTitle, sizeof(fullTitle), "%s", discTitle);
-    }
-
-    // 5. Determine operation mode (ISO is DEFAULT, folder mode if 'dont_make_iso' trigger is present)
-    int isFolderMode = CheckDontMakeIsoTrigger(usbMount);
-    int isIsoMode = !isFolderMode;
-
-    if (isFolderMode) {
-        LogMessage("[Main] >>> 'dont_make_iso' trigger detected on USB root! <<<");
-        LogMessage("[Main] Mode: Standard directory copy (folder mode)");
-    } else {
-        LogMessage("[Main] Mode: Direct bit-perfect ISO clone (/dev/cd0) [DEFAULT]");
-    }
-
-    char flagCopying[512];
-    char flagFinished[512];
-    char usbDstPath[512];
-
-    snprintf(flagCopying, sizeof(flagCopying), "%s/%s.copying", usbMount, fullTitle);
-    snprintf(flagFinished, sizeof(flagFinished), "%s/%s.finished", usbMount, fullTitle);
-
-    if (isIsoMode) {
-        snprintf(usbDstPath, sizeof(usbDstPath), "%s/%s.iso", usbMount, fullTitle);
-    } else {
-        snprintf(usbDstPath, sizeof(usbDstPath), "%s/%s", usbMount, fullTitle);
-    }
-
-    const char* encStatus;
-    if (discType == DISC_TYPE_PS3_GAME) {
-        encStatus = "PS3 Disc Encryption (DKEY / 3k3y / Redump)";
-    } else if (isEncrypted) {
-        encStatus = "ENCRYPTED (AACS - tagged .encrypted)";
-    } else {
-        encStatus = "CLEAR / UNENCRYPTED";
-    }
-
-    LogMessage("[Main] Path configuration:");
-    LogMessage("[Main]   Media type:    %s", typeDesc);
-    LogMessage("[Main]   Title:         %s", discTitle);
-    LogMessage("[Main]   Encryption:    %s", encStatus);
-    LogMessage("[Main]   Output name:   %s", fullTitle);
-    LogMessage("[Main]   Copying flag:  %s", flagCopying);
-    LogMessage("[Main]   Finished flag: %s", flagFinished);
-    LogMessage("[Main]   Destination:   %s (%s)", usbDstPath, isIsoMode ? "ISO image file" : "directory");
-
-    WebUpdateDiscInfo(discTitle, typeDesc, encStatus, isIsoMode ? "Direct ISO clone (/dev/cd0) [DEFAULT]" : "Directory copy (folder mode)", usbDstPath, 0);
-
-    // 6. Create empty <fullTitle>.copying flag file on USB
-    int flagFd = open(flagCopying, O_WRONLY | O_CREAT | O_TRUNC, 0777);
-    if (flagFd >= 0) {
-        close(flagFd);
-        LogMessage("[Main] Created empty flag file: %s (fd=%d)", flagCopying, flagFd);
-    } else {
-        LogMessage("[FATAL] Cannot create flag %s (errno=%d: %s)", flagCopying, errno, strerror(errno));
-        SendNotification("Error: Failed to create flag file on USB!");
-        CloseLog();
-        return -1;
-    }
-
-    int copyResult;
-    if (isIsoMode) {
-        // 7a. Direct optical disc sector-to-ISO clone from /dev/cd0 (DEFAULT)
-        LogMessage("[Main] Starting optical disc ISO clone: /dev/cd0 -> %s", usbDstPath);
-        copyResult = CopyDiscToIso(discPath, usbDstPath, usbMount, fullTitle);
-    } else {
-        // 7b. Standard directory copy
-        int mkRes = mkdir(usbDstPath, 0777);
-        if (mkRes == 0) {
-            LogMessage("[Main] Created target folder: %s", usbDstPath);
-        } else if (errno == EEXIST) {
-            LogMessage("[Main] Target folder already exists: %s", usbDstPath);
-        } else {
-            LogMessage("[Main] [WARN] mkdir(%s) failed: errno=%d (%s)", usbDstPath, errno, strerror(errno));
-        }
-        copyResult = CopyDisc(discPath, usbDstPath, usbMount, fullTitle);
-    }
-
-    if (copyResult == 0) {
-        WebSetComplete(1, "Clone completed successfully!");
-
-        // 8. Success: rename flag to <fullTitle>.finished
-        int renRet = rename(flagCopying, flagFinished);
-        if (renRet == 0) {
-            LogMessage("[Main] Renamed flag: %s -> %s (SUCCESS)", flagCopying, flagFinished);
-        } else {
-            LogMessage("[Main] [WARN] rename(%s, %s) failed: errno=%d (%s)", 
-                       flagCopying, flagFinished, errno, strerror(errno));
-            unlink(flagCopying);
-            int finFd = open(flagFinished, O_WRONLY | O_CREAT | O_TRUNC, 0777);
-            if (finFd >= 0) close(finFd);
-            LogMessage("[Main] Fallback: Created directly %s (finFd=%d)", flagFinished, finFd);
-        }
-
-        const char* mediaName = (discType == DISC_TYPE_PS3_GAME) ? "PS3 Game" : "Movie";
-        char finishedNotify[256];
-        if (isIsoMode) {
-            snprintf(finishedNotify, sizeof(finishedNotify), "%s \"%s\": ISO copy completed successfully!", mediaName, fullTitle);
-        } else {
-            snprintf(finishedNotify, sizeof(finishedNotify), "%s \"%s\": copy completed successfully!", mediaName, fullTitle);
-        }
-        SendNotification(finishedNotify);
-
-        LogMessage("==================================================");
-        LogMessage("=== BDclone Completed with Full Success! ===");
-        LogMessage("==================================================");
-        LogMessage("[Web] Keeping live web status page active for 60 seconds before exit...");
-        sleep(60);
-    } else {
-        WebSetComplete(0, "Clone aborted with error!");
-        SendNotification(isIsoMode ? "Error: Disc ISO copy failed!" : "Error: Disc copy failed!");
-        LogMessage("[FATAL] Copy failed with error: %d. Removing copying flag.", copyResult);
-        unlink(flagCopying);
-        if (isIsoMode) {
-            unlink(usbDstPath);
-        }
-        sleep(15);
+        LogMessage("[Main] Optical disc ejected. Resetting status, ready for next disc...");
+        SendNotification("BDclone Ready: Insert next disc");
+        WebResetState();
+        sleep(2);
     }
 
     // Stop web server thread gracefully
     g_webServerRunning = 0;
     pthread_join(g_webThread, NULL);
 
+    LogMessage("[Main] BDclone daemon terminated cleanly.");
     CloseLog();
-    return copyResult;
+    return 0;
 }
